@@ -1,0 +1,176 @@
+---
+title: "XGBOOST on Auction Data"
+author: "C. Blain Morin"
+date: "10/14/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+```
+
+```{r setup2}
+
+### Load Libraries
+library(tidyverse)
+library(caret)
+library(haven)
+library(reshape2)
+
+### Load data
+auctiondf = read_dta("SSO Auction Data_9-12-22.dta") %>%
+  mutate(tranche_load = Tranches * ActualOnPeakLoad_billions) 
+
+
+### Select certain columns
+auctiondf = auctiondf %>%
+  select(Utility,
+         RegisteredBidders,
+         Tranches,
+         Price,
+         tranche_load,
+         FWD_mths,
+         AuctionRounds,
+         FwdOnPeakMean,
+         ImpliedVolatility,
+         CapacityPriceLoadWeighted_thous)
+
+
+
+```
+
+# Split into Train and Test Data
+
+* Using 80% of the data for training
+* Using random sampling that preserves the Utility balance
+
+```{r}
+
+set.seed(12432)
+
+train_index = createDataPartition(auctiondf$Utility,
+                                  p = .8,
+                                  list = FALSE)
+
+
+train_df = auctiondf[train_index, ]
+
+test_df = auctiondf[-train_index, ]
+
+```
+
+## Check distributions of the continuous vars in training set
+
+```{r}
+
+train_df_c = train_df %>%
+  select(RegisteredBidders,
+         Tranches,
+         tranche_load,
+         FWD_mths,
+         AuctionRounds,
+         FwdOnPeakMean,
+         ImpliedVolatility,
+         CapacityPriceLoadWeighted_thous)
+
+melt(train_df_c) %>%
+  ggplot(aes(x = value)) +
+  stat_density() +
+  facet_wrap(~variable, scales = "free") +
+  theme_bw()
+
+
+```
+
+* They look mostly alright, will try logging tranches
+
+```{r}
+
+train_df_c2 = train_df_c %>%
+  mutate(Tranches = log(Tranches))
+
+melt(train_df_c2) %>%
+  ggplot(aes(x = value)) +
+  stat_density() +
+  facet_wrap(~variable, scales = "free") +
+  theme_bw()
+
+```
+
+* Doesn't really help, so going to ignore the log transform for simplicity's sake
+
+# Center and scale predictors
+
+```{r}
+
+c_scale = preProcess(train_df_c,
+                        method = c("center", "scale"))
+
+train_df_c_scale = predict(c_scale,
+                           train_df_c)
+
+
+```
+
+
+# Attach continuous predictors back to the factor vars
+
+```{r}
+
+cs = names(train_df_c)
+
+non_cs = train_df %>%
+  select(-one_of(cs))
+
+train_df_final = cbind(non_cs, train_df_c_scale)
+
+
+```
+
+
+# Tune xgboost
+
+```{r}
+
+### Make training matrix
+xtrain = model.matrix(Price ~ .,
+                      data = train_df_final)
+
+### Remove intercept
+xtrain = xtrain[ , -1]
+
+### Grab outcome vector
+ytrain = train_df_final$Price
+
+### Create hyperparameter tuning grid
+xgbgrid = expand.grid(
+  
+  eta = seq(.01, .31, by = .01),
+  max_depth = seq(1, 50, by = 5),
+  gamma = 0,
+  min_child_weight = seq(0, 3, by = 1),
+  subsample = seq(0, 1, by = .2),
+  nrounds = seq(0, 200, by = 50),
+  colsample_bytree = seq(.5, 1, by = .5)
+  
+)
+
+### Specify 10 fold cross validation
+xgbcontrol = trainControl(
+  method = "cv",
+  number = 10
+)
+
+xgbtune = train(
+  x = xtrain,
+  y = ytrain,
+  method = "xgbTree",
+  trControl = xgbcontrol,
+  metric = "RMSE",
+  tuneGrid = xgbgrid
+)
+
+```
+
